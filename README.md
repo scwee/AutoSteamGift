@@ -1,0 +1,2 @@
+# AutoSteamGift
+Plugin for FunpayCardinal
