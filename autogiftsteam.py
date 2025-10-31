@@ -1,16 +1,15 @@
-"""
+
+   """
 ═══════════════════════════════════════════════════════════════════════════
-    AUTO STEAM GIFT SENDER v3.0.0 - Финальная версия
+    AUTO STEAM GIFT SENDER v3.1.0 - ФИНАЛЬНАЯ ВЕРСИЯ
 ═══════════════════════════════════════════════════════════════════════════
 Автоматическая отправка Steam гифтов через API ns.gifts
+JWT авторизация: email + password → токен с автообновлением
 Команда: /gift_steam
 """
 
 from __future__ import annotations
 from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from cardinal import Cardinal
-
 from FunPayAPI.updater.events import NewOrderEvent, NewMessageEvent
 from FunPayAPI.types import Message
 from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
@@ -20,38 +19,118 @@ import requests
 import json
 import os
 import re
+import time
 from datetime import datetime
+
+if TYPE_CHECKING:
+    from cardinal import Cardinal
 
 # ═══════════════════════════════════════════════════════════════════════════
 # МЕТАДАННЫЕ
 # ═══════════════════════════════════════════════════════════════════════════
 NAME = "Auto Steam Gift Sender"
-VERSION = "3.0.0"
-DESCRIPTION = "Автоматическая отправка Steam гифтов через API ns.gifts"
-CREDITS = "Based on auto_steam_points.py"
+VERSION = "3.1"
+DESCRIPTION = "Автоматическая отправка Steam гифтов через API ns.gifts с JWT авторизацией"
+CREDITS = "@Scwee_xz"
 UUID = "a7f3c8e2-9d4b-4f1a-8e5c-2b9d7f6a3c1e"
 SETTINGS_PAGE = False
 
 # ═══════════════════════════════════════════════════════════════════════════
-# API КЛИЕНТ
+# API КЛИЕНТ С JWT АВТОРИЗАЦИЕЙ
 # ═══════════════════════════════════════════════════════════════════════════
 API_BASE_URL = "https://api.ns.gifts/api/v1"
 
-class NSGiftsAPIClient:
-    """Клиент для работы с NS.Gifts API"""
+TOKEN_DATA = {
+    "token": None,
+    "expiry": 0
+}
+
+def get_token(api_login: str, api_password: str) -> str:
+    """
+    Получить JWT токен через email/password
+    Кеширует токен до истечения срока действия (valid_thru)
+    Автоматически обновляет токен при истечении
     
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.headers = {
+    API: POST /api/v1/get_token
+    Body: {"email": "...", "password": "..."}
+    Response: {"token": "...", "valid_thru": timestamp}
+    """
+    global TOKEN_DATA
+    
+    # Если токен ещё действителен - возвращаем
+    if TOKEN_DATA["token"] and time.time() < TOKEN_DATA["expiry"]:
+        logger.debug(f"[SteamGifts] Используем кешированный токен")
+        return TOKEN_DATA["token"]
+    
+    # Запрашиваем новый токен
+    logger.info(f"[SteamGifts] Запрос нового токена для {api_login}")
+    
+    payload = {
+        "email": api_login,
+        "password": api_password
+    }
+    
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/get_token",
+            json=payload,
+            timeout=10
+        )
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        # Поддержка разных форматов ответа
+        token = (
+            data.get("token") or 
+            data.get("access_token") or 
+            (data.get("data", {}).get("token") if isinstance(data.get("data"), dict) else None)
+        )
+        
+        if not token:
+            raise Exception(f"Токен не найден в ответе API: {data}")
+        
+        # Сохраняем токен и время истечения
+        TOKEN_DATA["token"] = token
+        TOKEN_DATA["expiry"] = data.get("valid_thru", time.time() + 7200)  # 2 часа по умолчанию
+        
+        expiry_time = datetime.fromtimestamp(TOKEN_DATA["expiry"]).strftime("%Y-%m-%d %H:%M:%S")
+        logger.info(f"[SteamGifts] ✅ Токен получен, действителен до {expiry_time}")
+        
+        return TOKEN_DATA["token"]
+        
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 401:
+            raise Exception("Неверный логин или пароль")
+        elif e.response.status_code == 403:
+            raise Exception("Доступ запрещён")
+        else:
+            raise Exception(f"HTTP {e.response.status_code}: {e.response.text}")
+    except Exception as e:
+        logger.error(f"[SteamGifts] Ошибка получения токена: {e}")
+        raise Exception(f"Не удалось получить токен: {str(e)}")
+
+
+class NSGiftsAPIClient:
+    """Клиент для работы с NS.Gifts API через JWT авторизацию"""
+    
+    def __init__(self, api_login: str, api_password: str):
+        self.api_login = api_login
+        self.api_password = api_password
+    
+    def _get_headers(self) -> dict:
+        """Получить заголовки с актуальным JWT токеном (автообновление)"""
+        token = get_token(self.api_login, self.api_password)
+        return {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
+            "Authorization": f"Bearer {token}"
         }
     
     def get_balance(self) -> float:
         """Получить баланс (GET /api/v1/check_balance)"""
         try:
             url = f"{API_BASE_URL}/check_balance"
-            response = requests.get(url, headers=self.headers, timeout=10)
+            response = requests.get(url, headers=self._get_headers(), timeout=10)
             response.raise_for_status()
             data = response.json()
             
@@ -60,7 +139,7 @@ class NSGiftsAPIClient:
             else:
                 raise Exception(f"API error: {data.get('error', 'Unknown')}")
         except Exception as e:
-            logging.error(f"[SteamGifts] Balance check error: {e}")
+            logger.error(f"[SteamGifts] Balance check error: {e}")
             raise
     
     def send_gift(self, steam_link: str, game_name: str, region: str = "ru") -> dict:
@@ -76,7 +155,7 @@ class NSGiftsAPIClient:
                 "giftDescription": "Спасибо за покупку!"
             }
             
-            response = requests.post(url, json=payload, headers=self.headers, timeout=30)
+            response = requests.post(url, json=payload, headers=self._get_headers(), timeout=30)
             response.raise_for_status()
             data = response.json()
             
@@ -87,7 +166,7 @@ class NSGiftsAPIClient:
                 raise Exception(f"API error: {error}")
                 
         except Exception as e:
-            logging.error(f"[SteamGifts] Gift send error: {e}")
+            logger.error(f"[SteamGifts] Gift send error: {e}")
             return {"success": False, "error": str(e)}
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -97,7 +176,8 @@ CONFIG_DIR = "storage/steam_gifts"
 CONFIG_PATH = f"{CONFIG_DIR}/config.json"
 
 DEFAULT_CONFIG = {
-    "api_key": "",
+    "api_login": "",
+    "api_password": "",
     "auto_refunds": False,
     "lot_game_mapping": {},
     "templates": {
@@ -106,7 +186,6 @@ DEFAULT_CONFIG = {
         "link_confirmation": "Подтвердите ваш Steam профиль:\n{link}\n\nОтправьте + для подтверждения или - для отмены",
         "purchase_success": "✅ Гифт \"{game_name}\" успешно отправлен!\n\n🎮 Проверьте подарки в Steam\n\nОставьте отзыв 😊",
         "purchase_error": "❌ Ошибка отправки: {error}\n\nОбратитесь к продавцу",
-        "insufficient_balance": "⚠️ Недостаточно средств на балансе!\n\nОбратитесь к продавцу"
     },
     "order_history": []
 }
@@ -122,10 +201,7 @@ config = {}
 waiting_for_link = {}
 order_history = []
 
-# ═══════════════════════════════════════════════════════════════════════════
-# CALLBACK ДАННЫЕ
-# ═══════════════════════════════════════════════════════════════════════════
-CB_API = "sg_api"
+CB_AUTH = "sg_auth"
 CB_STATS = "sg_stats"
 CB_LOTS = "sg_lots"
 CB_ADD_LOT = "sg_addlot"
@@ -138,7 +214,6 @@ CB_BACK = "sg_back"
 # РАБОТА С КОНФИГУРАЦИЕЙ
 # ═══════════════════════════════════════════════════════════════════════════
 def ensure_config():
-    """Загрузить конфигурацию"""
     global config, order_history
     
     if not os.path.exists(CONFIG_DIR):
@@ -164,7 +239,6 @@ def ensure_config():
 
 
 def save_config():
-    """Сохранить конфигурацию"""
     global config, order_history
     config['order_history'] = order_history
     
@@ -175,22 +249,16 @@ def save_config():
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ═══════════════════════════════════════════════════════════════════════════
 def is_valid_link(link: str) -> tuple[bool, str]:
-    """Проверка валидности Steam ссылки"""
     pattern = r"https?://steamcommunity\.com/(id|profiles)/[A-Za-z0-9_-]+"
-    
     if re.match(pattern, link):
         return True, ""
-    
     return False, config['templates']['invalid_link']
 
 
 def format_template(template_name: str, **kwargs) -> str:
-    """Форматировать шаблон сообщения"""
     template = config['templates'].get(template_name, "")
-    
     if not template:
         return DEFAULT_CONFIG['templates'].get(template_name, "")
-    
     try:
         return template.format(**kwargs)
     except KeyError:
@@ -198,22 +266,17 @@ def format_template(template_name: str, **kwargs) -> str:
 
 
 def get_game_by_lot(lot_id: str) -> tuple[str | None, str | None]:
-    """Получить игру и регион по ID лота"""
     lot_data = config.get("lot_game_mapping", {}).get(str(lot_id))
-    
     if not lot_data:
         return None, None
-    
     if isinstance(lot_data, str):
         return lot_data, "ru"
-    
     return lot_data.get("name"), lot_data.get("region", "ru")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ОБРАБОТКА ЗАКАЗОВ FUNPAY
 # ═══════════════════════════════════════════════════════════════════════════
 def handle_new_order(c, event):
-    """Обработка нового заказа"""
     global waiting_for_link
     
     order_id = event.order.id
@@ -270,7 +333,6 @@ def handle_new_order(c, event):
 
 
 def handle_new_message(c, event):
-    """Обработка новых сообщений"""
     global waiting_for_link
     
     msg = event.message
@@ -283,8 +345,6 @@ def handle_new_message(c, event):
     
     text = text.replace('\u2061', '').strip()
     
-    logger.debug(f"[SteamGifts] Message: {text[:50]}...")
-    
     for order_id, data in list(waiting_for_link.items()):
         if data['buyer_id'] == author_id:
             
@@ -296,7 +356,6 @@ def handle_new_message(c, event):
                     return
                 
                 link = link_match.group(0)
-                
                 ok, reason = is_valid_link(link)
                 
                 if not ok:
@@ -334,7 +393,6 @@ def handle_new_message(c, event):
 
 
 def process_purchase(c, data):
-    """Обработка покупки гифта"""
     global api_client, order_history
     
     chat_id = data['chat_id']
@@ -398,7 +456,6 @@ def process_purchase(c, data):
 
 
 def try_refund(c, order_id, reason):
-    """Попытка возврата"""
     if not config.get('auto_refunds', False):
         return False
     
@@ -414,14 +471,13 @@ def try_refund(c, order_id, reason):
 # TELEGRAM ПАНЕЛЬ
 # ═══════════════════════════════════════════════════════════════════════════
 def create_main_keyboard():
-    """Главная клавиатура"""
     kb = K(row_width=2)
     
-    api_status = "✅" if config.get('api_key') else "❌"
+    auth_status = "✅" if config.get('api_login') and config.get('api_password') else "❌"
     lots_count = len(config.get('lot_game_mapping', {}))
     
     kb.row(
-        B(f"🔑 API {api_status}", callback_data=CB_API),
+        B(f"🔐 Авторизация {auth_status}", callback_data=CB_AUTH),
         B("💰 Баланс", callback_data=CB_BALANCE)
     )
     kb.row(
@@ -436,16 +492,15 @@ def create_main_keyboard():
 
 
 def show_main_panel(message_or_call):
-    """Показать главную панель"""
-    api_key = config.get('api_key', '')
-    api_display = f"{api_key[:8]}...{api_key[-4:]}" if len(api_key) > 12 else ("Не указан" if not api_key else api_key)
+    api_login = config.get('api_login', '')
+    login_display = f"{api_login[:4]}...{api_login[-4:]}" if len(api_login) > 8 else ("Не указан" if not api_login else api_login)
     
     lots_count = len(config.get('lot_game_mapping', {}))
     orders_count = len(order_history)
     
     text = f"""<b>🎮 Steam Gifts - Панель управления</b>
 
-<b>API ключ:</b> <code>{api_display}</code>
+<b>Логин:</b> <code>{login_display}</code>
 <b>Настроено лотов:</b> {lots_count}
 <b>Всего заказов:</b> {orders_count}
 
@@ -469,17 +524,42 @@ def show_main_panel(message_or_call):
             pass
 
 
-def handle_api_callback(call: CallbackQuery):
-    """Настройка API ключа"""
+def handle_auth_callback(call: CallbackQuery):
     msg = bot.send_message(
         call.message.chat.id,
-        "🔑 Отправьте ваш API ключ от ns.gifts:"
+        "🔐 <b>Авторизация ns.gifts</b>\n\n<b>Шаг 1/2:</b> Введите ваш email:",
+        parse_mode="HTML"
     )
-    bot.register_next_step_handler(msg, process_api_key, call.message.chat.id, call.message.id)
+    bot.register_next_step_handler(msg, process_login, call.message.chat.id, call.message.id)
 
 
-def process_api_key(message: TGMessage, chat_id: int, msg_id: int):
-    """Обработка API ключа"""
+def process_login(message: TGMessage, chat_id: int, msg_id: int):
+    try:
+        bot.delete_message(chat_id, message.id - 1)
+        bot.delete_message(chat_id, message.id)
+    except:
+        pass
+    
+    login = message.text.strip()
+    
+    if not login or '@' not in login:
+        bot.send_message(chat_id, "❌ Неверный формат email!")
+        show_main_panel(message)
+        return
+    
+    if not hasattr(cardinal, '_temp_auth_data'):
+        cardinal._temp_auth_data = {}
+    cardinal._temp_auth_data[chat_id] = {"login": login}
+    
+    msg = bot.send_message(
+        chat_id,
+        f"🔐 <b>Авторизация ns.gifts</b>\n\n<b>Шаг 2/2:</b> Введите ваш пароль:\n\n<b>Email:</b> <code>{login}</code>",
+        parse_mode="HTML"
+    )
+    bot.register_next_step_handler(msg, process_password, chat_id, msg_id)
+
+
+def process_password(message: TGMessage, chat_id: int, msg_id: int):
     global api_client, config
     
     try:
@@ -488,16 +568,43 @@ def process_api_key(message: TGMessage, chat_id: int, msg_id: int):
     except:
         pass
     
-    api_key = message.text.strip()
-    config['api_key'] = api_key
+    password = message.text.strip()
+    
+    if not password:
+        bot.send_message(chat_id, "❌ Пароль не может быть пустым!")
+        show_main_panel(message)
+        return
+    
+    if not hasattr(cardinal, '_temp_auth_data') or chat_id not in cardinal._temp_auth_data:
+        bot.send_message(chat_id, "❌ Ошибка: данные авторизации потеряны")
+        show_main_panel(message)
+        return
+    
+    login = cardinal._temp_auth_data[chat_id]["login"]
+    del cardinal._temp_auth_data[chat_id]
+    
+    config['api_login'] = login
+    config['api_password'] = password
     save_config()
     
     try:
-        api_client = NSGiftsAPIClient(api_key=api_key)
+        api_client = NSGiftsAPIClient(api_login=login, api_password=password)
         balance = api_client.get_balance()
-        bot.send_message(chat_id, f"✅ API ключ сохранён!\n\n💰 Баланс: {balance} руб.")
+        
+        bot.send_message(
+            chat_id,
+            f"✅ <b>Авторизация успешна!</b>\n\n💰 Баланс: {balance} руб.",
+            parse_mode="HTML"
+        )
+        logger.info(f"[SteamGifts] Авторизация успешна для {login}")
+        
     except Exception as e:
-        bot.send_message(chat_id, f"⚠️ API ключ сохранён, но проверка не удалась:\n{str(e)}")
+        bot.send_message(
+            chat_id,
+            f"⚠️ <b>Авторизация не удалась</b>\n\n{str(e)}\n\nДанные сохранены, попробуйте позже.",
+            parse_mode="HTML"
+        )
+        logger.error(f"[SteamGifts] Ошибка авторизации: {e}")
     
     try:
         bot.delete_message(chat_id, msg_id)
@@ -508,9 +615,8 @@ def process_api_key(message: TGMessage, chat_id: int, msg_id: int):
 
 
 def handle_balance_callback(call: CallbackQuery):
-    """Проверка баланса"""
     if not api_client:
-        bot.answer_callback_query(call.id, "❌ API ключ не настроен!", show_alert=True)
+        bot.answer_callback_query(call.id, "❌ Сначала авторизуйтесь!", show_alert=True)
         return
     
     try:
@@ -521,7 +627,6 @@ def handle_balance_callback(call: CallbackQuery):
 
 
 def handle_stats_callback(call: CallbackQuery):
-    """Статистика"""
     total_orders = len(order_history)
     
     if total_orders == 0:
@@ -559,7 +664,6 @@ def handle_stats_callback(call: CallbackQuery):
 
 
 def handle_lots_callback(call: CallbackQuery):
-    """Управление лотами"""
     lot_game_mapping = config.get("lot_game_mapping", {})
     
     if not lot_game_mapping:
@@ -595,7 +699,6 @@ def handle_lots_callback(call: CallbackQuery):
 
 
 def handle_add_lot_callback(call: CallbackQuery):
-    """Добавление лота - шаг 1"""
     msg = bot.send_message(
         call.message.chat.id,
         "➕ <b>Добавление лота</b>\n\n<b>Шаг 1/3:</b> Введите ID лота",
@@ -605,7 +708,6 @@ def handle_add_lot_callback(call: CallbackQuery):
 
 
 def process_lot_id(message: TGMessage, chat_id: int, msg_id: int):
-    """Шаг 2: Название игры"""
     try:
         bot.delete_message(chat_id, message.id - 1)
     except:
@@ -634,7 +736,6 @@ def process_lot_id(message: TGMessage, chat_id: int, msg_id: int):
 
 
 def process_game_name(message: TGMessage, chat_id: int, msg_id: int, lot_id: str):
-    """Шаг 3: Регион"""
     try:
         bot.delete_message(chat_id, message.id - 1)
     except:
@@ -670,7 +771,6 @@ def process_game_name(message: TGMessage, chat_id: int, msg_id: int, lot_id: str
 
 
 def handle_region_selection(call: CallbackQuery):
-    """Финальный шаг - сохранение"""
     parts = call.data.split("_")
     if len(parts) < 3:
         return
@@ -702,7 +802,6 @@ def handle_region_selection(call: CallbackQuery):
     
     bot.answer_callback_query(call.id, "Лот добавлен!")
     
-    import time
     import threading
     def show_delayed():
         time.sleep(2)
@@ -711,7 +810,6 @@ def handle_region_selection(call: CallbackQuery):
 
 
 def handle_delete_lot(call: CallbackQuery):
-    """Удаление лота"""
     lot_id = call.data.replace(CB_DEL_LOT, "")
     
     lot_game_mapping = config.get("lot_game_mapping", {})
@@ -729,7 +827,6 @@ def handle_delete_lot(call: CallbackQuery):
 
 
 def handle_toggle_refunds(call: CallbackQuery):
-    """Переключение авторефундов"""
     config['auto_refunds'] = not config.get('auto_refunds', False)
     save_config()
     
@@ -740,16 +837,14 @@ def handle_toggle_refunds(call: CallbackQuery):
 
 
 def handle_back(call: CallbackQuery):
-    """Возврат на главную"""
     show_main_panel(call)
 
 
 def handle_callback(call: CallbackQuery):
-    """Роутер callback'ов"""
     data = call.data
     
-    if data == CB_API:
-        handle_api_callback(call)
+    if data == CB_AUTH:
+        handle_auth_callback(call)
     elif data == CB_BALANCE:
         handle_balance_callback(call)
     elif data == CB_STATS:
@@ -771,15 +866,13 @@ def handle_callback(call: CallbackQuery):
 
 
 def handle_command(message: TGMessage):
-    """Обработка команды /gift_steam"""
     if message.text == "/gift_steam":
         show_main_panel(message)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ИНИЦИАЛИЗАЦИЯ И ЗАВЕРШЕНИЕ
+# ИНИЦИАЛИЗАЦИЯ
 # ═══════════════════════════════════════════════════════════════════════════
 def init_commands(c):
-    """Инициализация плагина"""
     global bot, cardinal, config, api_client
     
     cardinal = c
@@ -791,11 +884,14 @@ def init_commands(c):
         [("gift_steam", "Steam Gifts панель", True)]
     )
     
-    if config.get('api_key'):
-        api_client = NSGiftsAPIClient(api_key=config['api_key'])
+    if config.get('api_login') and config.get('api_password'):
+        api_client = NSGiftsAPIClient(
+            api_login=config['api_login'],
+            api_password=config['api_password']
+        )
         logger.info("[SteamGifts] API client initialized")
     else:
-        logger.warning("[SteamGifts] API key not configured")
+        logger.warning("[SteamGifts] Авторизация не настроена")
     
     bot.register_message_handler(handle_command, commands=['gift_steam'])
     bot.register_callback_query_handler(
@@ -807,7 +903,6 @@ def init_commands(c):
 
 
 def cleanup(c):
-    """Очистка при удалении"""
     global config, order_history, waiting_for_link
     
     try:
@@ -823,9 +918,7 @@ def cleanup(c):
     
     logger.info(f"[SteamGifts] Plugin v{VERSION} stopped")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# ПРИВЯЗКА К СОБЫТИЯМ
-# ═══════════════════════════════════════════════════════════════════════════
+
 BIND_TO_PRE_INIT = [init_commands]
 BIND_TO_NEW_ORDER = [handle_new_order]
 BIND_TO_NEW_MESSAGE = [handle_new_message]
